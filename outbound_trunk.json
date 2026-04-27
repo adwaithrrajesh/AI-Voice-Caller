@@ -1,0 +1,12 @@
+{
+  "//": "Vobiz outbound SIP trunk for LiveKit. Apply once with: lk sip outbound create outbound_trunk.json",
+  "//1": "Get the values below from the Vobiz dashboard -> Trunks -> Outbound -> Authentication & Linking",
+  "trunk": {
+    "name": "Vobiz Outbound (FlowXperia)",
+    "address": "<your_unique_domain>.sip.vobiz.ai",
+    "transport": "TRANSPORT_TYPE_AUTO",
+    "numbers": ["+91XXXXXXXXXX"],
+    "auth_username": "<vobiz_username>",
+    "auth_password": "<vobiz_password>"
+  }
+}

@@ -1,0 +1,13 @@
+# LiveKit Agents framework + Sarvam plugin (STT + LLM + TTS in one package)
+livekit-agents>=1.2.0,<2.0.0
+livekit-plugins-sarvam>=1.5.6,<2.0.0
+
+# Loads SARVAM_API_KEY from a local .env file
+python-dotenv>=1.0.1
+
+# Console mode audio I/O (mic in, speaker out, terminal UI).
+# livekit-agents already pulls these in, but pinning here keeps the
+# install reproducible.
+sounddevice>=0.4.6
+nest-asyncio>=1.6.0
+rich>=13.7.0
