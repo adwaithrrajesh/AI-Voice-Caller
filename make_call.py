@@ -2,7 +2,7 @@
 make_call.py — initiate an outbound AI sales call.
 
 Usage:
-    python make_call.py +91XXXXXXXXXX --name "Krish" --lang hi-IN
+    python make_call.py +91XXXXXXXXXX --name "Krish" --lang en-IN
 
 Flow:
     1. Create a unique LiveKit room with metadata describing the prospect.
@@ -169,10 +169,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--lang",
-        default="hi-IN",
+        default="en-IN",
         help=(
-            "BCP-47 language hint for the agent's TTS. One of: en-IN, hi-IN, "
-            "ta-IN, te-IN, bn-IN, mr-IN, gu-IN, kn-IN, ml-IN, pa-IN, od-IN."
+            "BCP-47 language hint for the agent's TTS. Default en-IN "
+            "(Indian English, clear/crisp). Other options: hi-IN, ta-IN, "
+            "te-IN, bn-IN, mr-IN, gu-IN, kn-IN, ml-IN, pa-IN, od-IN."
         ),
     )
     args = parser.parse_args()

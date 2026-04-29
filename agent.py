@@ -19,7 +19,7 @@ Environment:
                           name make_call.py dispatches with
 
 Per-call context is delivered via room metadata, a JSON blob like:
-    {"name": "Krish", "phone": "+91...", "lang_hint": "hi-IN"}
+    {"name": "Krish", "phone": "+91...", "lang_hint": "en-IN"}
 make_call.py packs this into the room when it dispatches the agent.
 """
 
@@ -28,22 +28,58 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Annotated
+from typing import Annotated, AsyncIterable
 
+import numpy as np
 from dotenv import load_dotenv
+from livekit import rtc
 from livekit.agents import (
     Agent,
     AgentSession,
     JobContext,
+    ModelSettings,
     RunContext,
     TurnHandlingOptions,
     WorkerOptions,
     cli,
     function_tool,
 )
+from livekit.agents.voice.transcription.text_transforms import replace as text_replace
 from livekit.plugins import sarvam
 
 from prompts import build_instructions
+
+
+# ---------------------------------------------------------------------------
+# Text transforms: clean LLM output before it hits the TTS
+# ---------------------------------------------------------------------------
+# Sarvam's TTS uses a sentence tokenizer that splits on . ! ? — every split
+# resets prosody. We collapse the LLM's chattier punctuation into commas
+# and spaces so the TTS treats clauses as one breath-group, not many.
+async def _smooth_punctuation(text):
+    """Replace ellipses / em-dashes / multi-period with commas + space.
+
+    Why: '...' and '—' force the TTS into hard pauses with flat prosody on
+    re-entry. Commas keep prosody flowing across the clause.
+    """
+    import re as _re
+    async for chunk in text:
+        # collapse ellipsis '...' or '…' into ', '
+        chunk = _re.sub(r"\s*(\.{3,}|…)\s*", ", ", chunk)
+        # em/en dash → comma
+        chunk = _re.sub(r"\s*[—–]\s*", ", ", chunk)
+        # double-period mishaps → single
+        chunk = _re.sub(r"\.{2}", ".", chunk)
+        yield chunk
+
+
+# Strip artifacts that the LLM produces for code-mixed words. These confuse
+# Bulbul v3's pronouncer and make the read sound mechanical.
+_CODEMIX_FIXUPS = {
+    "FlowXperia-": "Flow Xperia ",
+    "Flow Xperia-": "Flow Xperia ",
+    " - ": ", ",
+}
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -58,6 +94,23 @@ logging.basicConfig(
 logger = logging.getLogger("sales-agent")
 
 AGENT_NAME = os.getenv("AGENT_NAME", "sales-agent")
+
+# --- TTS tuning (overridable via env vars without code changes) ------------
+# For clear / crisp Indian English we default to `shubh` (v3 Customer
+# Care category) — Customer Care voices are tuned for clarity and clean
+# enunciation, exactly what "crisp Indian English" calls for. The
+# Content Creation voices are warmer but slightly less articulate.
+#   shubh   - Customer Care, crispest articulation (default for English)
+#   ratan   - Customer Care, slightly deeper
+#   rohan   - Customer Care, neutral male
+#   aditya  - Content Creation, warmer/conversational
+#   kabir   - Content Creation, deeper timbre
+TTS_SPEAKER = os.getenv("TTS_SPEAKER", "shubh")
+
+# Digital gain applied to TTS PCM frames. 1.0 = no change. 2.0 ≈ +6 dB
+# (perceived ~2x louder). 3.0 ≈ +9.5 dB (close to clipping ceiling for
+# typical TTS output). Anything above 3.0 will clip and sound harsh.
+TTS_GAIN = float(os.getenv("TTS_GAIN", "2.0"))
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +133,10 @@ def parse_call_context(metadata: str | None) -> dict:
     return {
         "name": ctx.get("name") or os.getenv("PROSPECT_NAME", "there"),
         "phone": ctx.get("phone"),
-        "lang_hint": ctx.get("lang_hint", "hi-IN"),
+        # Default to en-IN so Bulbul v3 synthesizes with the Indian
+        # English phoneme set (clear / crisp). Saarika STT still
+        # auto-detects whatever language the prospect actually speaks.
+        "lang_hint": ctx.get("lang_hint", "en-IN"),
     }
 
 
@@ -110,18 +166,57 @@ class SalesAgent(Agent):
     # -- Lifecycle -----------------------------------------------------------
 
     async def on_enter(self) -> None:
-        """Greet the prospect immediately on join.
+        """Speak first the moment the call connects.
 
-        On telephony calls this fires right after the prospect picks up,
-        so the agent always speaks first.
+        Minimal nudge — the actual opening line is defined inside the
+        system prompt. This keeps persona changes a one-file edit.
         """
         await self.session.generate_reply(
             instructions=(
-                "Open the call now. Greet the prospect by name, introduce "
-                "yourself as Maya from FlowXperia, and ask if they have a "
-                "quick minute. Keep it under two short sentences."
+                "The call has just connected. Open with your natural "
+                "Manoj-style greeting, mention Flowxperia, and ask if they "
+                "have a minute. Vary the exact wording — do not repeat any "
+                "example line from the prompt verbatim."
             )
         )
+
+    # -- Audio post-processing: digital gain --------------------------------
+
+    async def tts_node(
+        self,
+        text: AsyncIterable[str],
+        model_settings: ModelSettings,
+    ) -> AsyncIterable[rtc.AudioFrame]:
+        """Apply digital gain to every TTS audio frame on its way out.
+
+        Bulbul v3 doesn't expose a `loudness` parameter (only v2 does),
+        and LiveKit's RoomOutputOptions has no volume knob — so the only
+        place we can boost perceived loudness is here, in the audio
+        pipeline. We multiply each int16 PCM sample by TTS_GAIN and clip
+        to the int16 range to avoid wrap-around distortion.
+
+        TTS_GAIN env var: 1.0=no change, 2.0≈+6dB (default), 3.0≈+9.5dB.
+        """
+        gain = TTS_GAIN
+
+        # Get the default Sarvam-TTS audio stream (this calls the plugin).
+        async for frame in Agent.default.tts_node(self, text, model_settings):
+            if gain == 1.0:
+                yield frame
+                continue
+
+            # frame.data is bytes of interleaved int16 PCM samples.
+            samples = np.frombuffer(frame.data, dtype=np.int16)
+            boosted = np.clip(
+                samples.astype(np.int32) * gain, -32768, 32767
+            ).astype(np.int16)
+
+            yield rtc.AudioFrame(
+                data=boosted.tobytes(),
+                sample_rate=frame.sample_rate,
+                num_channels=frame.num_channels,
+                samples_per_channel=frame.samples_per_channel,
+            )
 
     # -- Function tools (callable by the LLM mid-conversation) --------------
 
@@ -214,22 +309,40 @@ async def entrypoint(ctx: JobContext) -> None:
         flush_signal=True,
     )
 
-    # LLM — Sarvam-30B (use sarvam-30b-16k / sarvam-105b for more context/quality).
+    # LLM — Sarvam-30B. Temperature 0.75 gives strong lexical variation
+    # so two turns never sound identical. Drop to 0.5 if you see it go
+    # off-script.
     llm = sarvam.LLM(
         model="sarvam-30b",
-        temperature=0.4,
+        temperature=0.75,
     )
 
-    # TTS — Bulbul. We seed it with the lang_hint passed by the dispatcher;
-    # for stricter language-matching, listen to user_input_transcribed and
-    # update tts.target_language_code at runtime.
+    # TTS — Bulbul v3 with `shubh`.
+    #
+    # Why this combo for Malayalam:
+    # - Bulbul v3 is the only Sarvam model with LLM-inferred prosody and
+    #   native code-mixed (Manglish) handling. In Sarvam's published blind
+    #   A/B against ElevenLabs and Cartesia Sonic-3 across 11 languages,
+    #   v3 won the 8 kHz telephony evaluation outright.
+    # - `shubh` is Sarvam's documented best-quality voice for Malayalam
+    #   specifically (the ml-IN list is short — shubh is on it).
+    # - v3 does NOT support pitch / loudness — intentionally absent.
+    # - 192k bitrate is the highest mp3 grade the API offers; cleaner
+    #   voiceband over telephony than the 128k default.
     tts = sarvam.TTS(
-        model="bulbul:v2",
+        model="bulbul:v3",
         target_language_code=call_ctx["lang_hint"],
-        speaker="anushka",
-        pitch=0.0,
+        speaker=TTS_SPEAKER,            # default 'aditya'; override via TTS_SPEAKER env var
         pace=1.0,
-        loudness=1.0,
+        temperature=0.9,                # max-useful prosodic variation in v3
+        speech_sample_rate=24000,       # v3 native rate
+        # The Sarvam plugin tokenizes by sentence then synthesizes per-chunk,
+        # so prosody is "reset" between chunks. Pushing both knobs to their
+        # plugin maximums (200 / 500) keeps as much text together as legally
+        # possible, giving v3 the longest possible spans for inflection.
+        max_chunk_length=500,
+        min_buffer_size=200,
+        output_audio_bitrate="192k",    # higher fidelity than the 128k default
     )
 
     session = AgentSession(
@@ -239,6 +352,16 @@ async def entrypoint(ctx: JobContext) -> None:
         # Sarvam STT does VAD + endpointing internally — let it drive turns.
         # Do NOT pass `vad=`.
         turn_handling=TurnHandlingOptions(turn_detection="stt"),
+        # Text transforms applied between LLM output and TTS input.
+        # `filter_markdown` and `filter_emoji` are the LiveKit defaults —
+        # we keep them and add our own smoothing for punctuation +
+        # code-mix fixups so v3 gets cleaner spans to apply prosody to.
+        tts_text_transforms=[
+            "filter_markdown",
+            "filter_emoji",
+            _smooth_punctuation,
+            text_replace(_CODEMIX_FIXUPS, case_sensitive=True),
+        ],
     )
 
     await session.start(
