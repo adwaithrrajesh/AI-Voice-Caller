@@ -36,7 +36,10 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
+# pyrefly: ignore [missing-import]
 from pydantic import Field, ValidationError, field_validator
+
+# pyrefly: ignore [missing-import]
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -129,6 +132,16 @@ class Settings(BaseSettings):
         "Tune to your Vobiz channel limit. Total system concurrency = "
         "N_workers × CALLS_PREFETCH.",
     )
+
+    # Live-Call Commands (mid-call nudge/interrupt)
+    commands_exchange: str = Field(default="voice-commands")
+    commands_queue: str = Field(default="voice-commands.inbound")
+    commands_routing_key: str = Field(default="inbound")
+
+    # Call Summaries (post-call report)
+    summaries_exchange: str = Field(default="voice-summaries")
+    summaries_queue: str = Field(default="voice-summaries.outbound")
+    summaries_routing_key: str = Field(default="outbound")
 
     # ----------------------------------------------------------------------
     # Operational / scaling

@@ -32,7 +32,9 @@ import os
 import sys
 import uuid
 
+# pyrefly: ignore [missing-import]
 from dotenv import load_dotenv
+# pyrefly: ignore [missing-import]
 from livekit import api
 
 load_dotenv()

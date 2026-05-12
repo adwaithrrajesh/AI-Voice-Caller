@@ -133,6 +133,7 @@ class Dispatcher:
             phone, name, lang, request_id,
             message.delivery_tag, message.redelivered,
         )
+        print(f"\n[QUEUE RECEIVED] phone={phone} name={name} request_id={request_id}")
 
         try:
             result = await place_call(
@@ -167,6 +168,7 @@ class Dispatcher:
             "Call dispatched ok phone=%s request_id=%s room=%s",
             phone, result.request_id, result.room_name,
         )
+        print(f"[CALL STATUS] phone={phone} status={result.status} room={result.room_name}\n")
         await message.ack()
 
     # ------------------------- task tracking ------------------------------

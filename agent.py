@@ -25,26 +25,26 @@ make_call.py packs this into the room when it dispatches the agent.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 from typing import Annotated, AsyncIterable
 
+import aio_pika
+from aio_pika import DeliveryMode
+# pyrefly: ignore [missing-import]
 import numpy as np
+# pyrefly: ignore [missing-import]
 from dotenv import load_dotenv
+# pyrefly: ignore [missing-import]
 from livekit import rtc
-from livekit.agents import (
-    Agent,
-    AgentSession,
-    JobContext,
-    ModelSettings,
-    RunContext,
-    TurnHandlingOptions,
-    WorkerOptions,
-    cli,
-    function_tool,
-)
+# pyrefly: ignore [missing-import]
+from livekit.agents import (Agent,AgentSession,JobContext,ModelSettings,RunContext,TurnHandlingOptions,
+    WorkerOptions,cli,function_tool)
+# pyrefly: ignore [missing-import]
 from livekit.agents.voice.transcription.text_transforms import replace as text_replace
+# pyrefly: ignore [missing-import]
 from livekit.plugins import sarvam
 
 from prompts import build_instructions
@@ -133,10 +133,11 @@ def parse_call_context(metadata: str | None) -> dict:
     return {
         "name": ctx.get("name") or os.getenv("PROSPECT_NAME", "there"),
         "phone": ctx.get("phone"),
-        # Default to en-IN so Bulbul v3 synthesizes with the Indian
-        # English phoneme set (clear / crisp). Saarika STT still
-        # auto-detects whatever language the prospect actually speaks.
         "lang_hint": ctx.get("lang_hint", "en-IN"),
+        "request_id": ctx.get("request_id"),
+        "tenant_id": ctx.get("tenant_id"),
+        "lead_id": ctx.get("lead_id"),
+        "prompt": ctx.get("prompt"),
     }
 
 
@@ -148,10 +149,12 @@ def parse_call_context(metadata: str | None) -> dict:
 class SalesAgent(Agent):
     """Outbound-sales agent with multilingual support and lead-capture tools."""
 
-    def __init__(self, *, prospect_name: str, phone: str | None) -> None:
+    def __init__(self, *, prospect_name: str, phone: str | None, session: AgentSession, call_ctx: dict) -> None:
         super().__init__(instructions=build_instructions(prospect_name))
         self.prospect_name = prospect_name
         self.phone = phone
+        self.agent_session = session
+        self.call_ctx = call_ctx
         self.lead_state: dict = {
             "name": prospect_name,
             "phone": phone,
@@ -161,6 +164,7 @@ class SalesAgent(Agent):
             "notes": [],
             "demo_scheduled": False,
             "demo_slot": None,
+            "prompt": call_ctx["prompt"]
         }
 
     # -- Lifecycle -----------------------------------------------------------
@@ -218,6 +222,37 @@ class SalesAgent(Agent):
                 samples_per_channel=frame.samples_per_channel,
             )
 
+    # -- Real-time Data Commands --------------------------------------------
+
+    async def handle_command(self, payload: dict) -> None:
+        """Handle an incoming command from the server via Data Channel."""
+        cmd_type = payload.get("type")
+        data = payload.get("data")
+
+        logger.info("Agent received command: type=%s", cmd_type)
+
+        if cmd_type == "nudge":
+            # Direct the LLM to mention something specific immediately.
+            text = data.get("text") if isinstance(data, dict) else str(data)
+            await self.session.generate_reply(
+                instructions=f"The supervisor has nudged you with this note: '{text}'. "
+                             f"Incorporate this into your next response naturally."
+            )
+
+        elif cmd_type == "interrupt":
+            # Force the agent to speak a specific string right now.
+            text = data.get("text") if isinstance(data, dict) else str(data)
+            await self.session.say(text, allow_interruptions=True)
+
+        elif cmd_type == "update_context":
+            # Update internal state or system instructions mid-call.
+            if isinstance(data, dict):
+                self.lead_state.update(data)
+                logger.info("Updated lead state from command: %s", self.lead_state)
+
+        else:
+            logger.warning("Unknown command type: %s", cmd_type)
+
     # -- Function tools (callable by the LLM mid-conversation) --------------
 
     @function_tool()
@@ -241,6 +276,17 @@ class SalesAgent(Agent):
         )
         self.lead_state["notes"].append(notes)
         logger.info("Captured lead: %s", self.lead_state)
+
+        # Broadcast the captured lead back to the room so the server/UI
+        # knows immediately without waiting for a webhook.
+        await self.agent_session.room.local_participant.publish_data(
+            json.dumps({
+                "event": "lead_captured",
+                "data": self.lead_state
+            }),
+            reliability=rtc.DataPacketKind.RELIABLE
+        )
+
         return "Lead saved."
 
     @function_tool()
@@ -273,8 +319,60 @@ class SalesAgent(Agent):
             "Thanks for your time, have a great day!",
             allow_interruptions=False,
         )
+        # Summary will be sent in the on_shutdown or session end hook
         await ctx.session.aclose()
         return "Call ended."
+
+    # -- Summary Generation --------------------------------------------------
+
+    async def send_summary(self) -> None:
+        """Generate a call summary using the LLM and publish it to RabbitMQ."""
+        logger.info("Generating call summary for %s...", self.phone)
+        
+        # Ask the LLM to summarize the conversation from its own history.
+        summary_reply = await self.session.generate_reply(
+            instructions=(
+                "The call has ended. Provide a concise JSON summary of this call. "
+                "Include: 'summary' (brief paragraph), 'disposition' (e.g. interested, "
+                "busy, wrong-number), 'next_steps', and 'sentiment' (positive/neutral/negative)."
+            )
+        )
+        
+        # Extract text from the reply.
+        summary_text = ""
+        async for chunk in summary_reply.text:
+            summary_text += chunk
+
+        try:
+            # Try to parse as JSON if the LLM followed instructions, else wrap in dict
+            try:
+                summary_data = json.loads(summary_text)
+            except json.JSONDecodeError:
+                summary_data = {"raw_summary": summary_text}
+
+            payload = {
+                "request_id": self.call_ctx.get("request_id"),
+                "tenant_id": self.call_ctx.get("tenant_id"),
+                "lead_id": self.call_ctx.get("lead_id"),
+                "phone": self.phone,
+                "summary": summary_data,
+                "lead_state": self.lead_state
+            }
+
+            from app.config import settings
+            connection = await aio_pika.connect_robust(settings.rabbitmq_url)
+            async with connection:
+                channel = await connection.channel()
+                await channel.default_exchange.publish(
+                    aio_pika.Message(
+                        body=json.dumps(payload).encode(),
+                        delivery_mode=DeliveryMode.PERSISTENT,
+                    ),
+                    routing_key=settings.summaries_queue,
+                )
+            logger.info("Published call summary to %s", settings.summaries_queue)
+        except Exception as e:
+            logger.error("Failed to generate/send summary: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +392,8 @@ async def entrypoint(ctx: JobContext) -> None:
     await ctx.connect()
 
     call_ctx = parse_call_context(ctx.room.metadata)
+    print(f"\n[AGENT JOINED] room={ctx.room.name} prospect={call_ctx['name']} phone={call_ctx['phone']}")
+    
     logger.info(
         "Joining room=%s for prospect=%s phone=%s lang_hint=%s",
         ctx.room.name,
@@ -364,13 +464,34 @@ async def entrypoint(ctx: JobContext) -> None:
         ],
     )
 
+    agent = SalesAgent(
+        prospect_name=call_ctx["name"],
+        phone=call_ctx["phone"],
+        session=session,
+        call_ctx=call_ctx,
+    )
+
+    # -- 2-Way Data Connection: Listener -----------------------------------
+    @ctx.room.on("data_received")
+    def on_data(data: rtc.DataPacket):
+        """Handle real-time JSON commands sent to the room."""
+        if data.participant is None:
+            return  # skip system messages if any
+
+        try:
+            payload = json.loads(data.data)
+            # Route to the agent's command handler
+            asyncio.create_task(agent.handle_command(payload))
+        except Exception:
+            logger.warning("Failed to parse data packet: %r", data.data)
+
     await session.start(
         room=ctx.room,
-        agent=SalesAgent(
-            prospect_name=call_ctx["name"],
-            phone=call_ctx["phone"],
-        ),
+        agent=agent,
     )
+
+    # When the session ends (call hangup), send the summary
+    await agent.send_summary()
 
 
 if __name__ == "__main__":
