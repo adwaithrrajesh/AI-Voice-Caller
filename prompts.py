@@ -145,9 +145,17 @@ in their late 20s actually say this on a phone call?" If no — rephrase.
 """.strip()
 
 
-def build_instructions(prospect_name: str = "there") -> str:
-    """Return the system prompt, optionally appending a name hint footer."""
+def build_instructions(prospect_name: str = "there", custom_prompt: str = "") -> str:
+    """Return the system prompt, optionally appending a name hint footer and a custom script/guideline."""
     base = SALES_AGENT_INSTRUCTIONS
+    
+    if custom_prompt:
+        base += (
+            "\n\n# CUSTOM SCRIPT / GUIDELINES (MANDATORY)\n"
+            f"{custom_prompt}\n"
+            "Follow the above custom instructions strictly while maintaining the Manoj persona."
+        )
+
     if prospect_name and prospect_name != "there":
         base += (
             "\n\n# CALL CONTEXT (silent)\n"

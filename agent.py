@@ -150,7 +150,8 @@ class SalesAgent(Agent):
     """Outbound-sales agent with multilingual support and lead-capture tools."""
 
     def __init__(self, *, prospect_name: str, phone: str | None, session: AgentSession, call_ctx: dict) -> None:
-        super().__init__(instructions=build_instructions(prospect_name))
+        custom_prompt = call_ctx.get("prompt", "")
+        super().__init__(instructions=build_instructions(prospect_name, custom_prompt))
         self.prospect_name = prospect_name
         self.phone = phone
         self.agent_session = session
